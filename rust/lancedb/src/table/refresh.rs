@@ -7,6 +7,12 @@
 //! therefore idempotent and does not observe input mutation -- once a row is
 //! filled, changing what the expression reads leaves the stored result alone.
 //!
+//! A column's computed inputs are filled first, each by its own refresh and
+//! commit, so the expression never reads an input's placeholder null as a
+//! value. Two concurrent fills of one input collide on its field in lance's
+//! conflict check, so a dependent fill can only commit over inputs that were
+//! already durable when it read them.
+//!
 //! Two passes per fragment. The first scans only the unfilled live rows and
 //! evaluates the expression over them, which yields the exact fill count and
 //! decides whether the fragment is staged at all -- a fragment where nothing
@@ -41,7 +47,8 @@ use crate::{Error, Result};
 /// The result of refreshing a computed column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RefreshColumnResult {
-    /// Rows that had a value computed.
+    /// Rows that had a value computed, in the requested column only; inputs
+    /// filled on its behalf are not counted.
     #[serde(default)]
     pub rows_filled: u64,
     /// The commit version associated with the operation.
@@ -74,7 +81,35 @@ async fn execute_refresh_column_with_source(
 
     let expression = declared_expression(&dataset, column)?;
     let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-    let bound = Arc::new(super::computed_columns::bind(schema, column, &expression)?);
+    let bound = Arc::new(super::computed_columns::bind(
+        schema.clone(),
+        column,
+        &expression,
+    )?);
+
+    // Inputs that are themselves computed are filled first, so their
+    // placeholder nulls are never read as values. Declarations are acyclic by
+    // construction: a column can only read what existed when it was declared.
+    for input in &bound.roots {
+        let Some(declaration) = schema
+            .field_with_name(input)
+            .ok()
+            .and_then(computed_column_from_field)
+        else {
+            continue;
+        };
+        if !matches!(declaration.kind, ComputedColumnKind::Sql { .. }) {
+            return Err(Error::NotSupported {
+                message: format!(
+                    "computed column '{column}' reads '{input}', which this refresh cannot \
+                     fill first; refresh '{input}' before '{column}'"
+                ),
+            });
+        }
+        Box::pin(execute_refresh_column_with_source(table, input)).await?;
+    }
+    // Re-read: the input fills above committed on this handle.
+    let dataset = table.dataset.get().await?;
     let field = dataset
         .schema()
         .field(column)
@@ -412,6 +447,37 @@ mod tests {
     async fn append(table: &Table, values: Vec<i32>) {
         let batch = record_batch!(("x", Int32, values)).unwrap();
         table.add(batch).execute().await.unwrap();
+    }
+
+    /// The gate's reproducer: `b = coalesce(a, 0)` refreshed before `a`
+    /// must not bake zeros from `a`'s placeholder null.
+    #[tokio::test]
+    async fn test_dependent_refresh_cannot_fill_from_placeholder_null() {
+        let table = table_with("dependent_refresh_order", vec![1, 2, 3]).await;
+        table
+            .add_columns()
+            .computed("a", "x + 1")
+            .computed("b", "coalesce(a, 0)")
+            .execute()
+            .await
+            .unwrap();
+
+        let result = table.refresh_column("b").await.unwrap();
+        assert_eq!(result.rows_filled, 3);
+        assert_eq!(read(&table, "a").await, vec![Some(2), Some(3), Some(4)]);
+        assert_eq!(
+            table.count_rows(Some("b = a".to_string())).await.unwrap(),
+            3
+        );
+        assert_eq!(table.refresh_column("a").await.unwrap().rows_filled, 0);
+
+        // Appended rows: the input is filled in the new fragment first too.
+        append(&table, vec![10]).await;
+        assert_eq!(table.refresh_column("b").await.unwrap().rows_filled, 1);
+        assert_eq!(
+            table.count_rows(Some("b = 0".to_string())).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
