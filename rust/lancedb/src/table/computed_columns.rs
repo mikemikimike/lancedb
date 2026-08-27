@@ -22,7 +22,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use datafusion_common::tree_node::TreeNode;
 use datafusion_physical_plan::PhysicalExpr;
 use lance::dataset::NewColumnTransform;
@@ -1273,6 +1273,11 @@ pub(crate) fn bind(schema: SchemaRef, column: &str, expression: &str) -> Result<
 /// refresh time: that the expression parses, that every column it reads
 /// exists, and that the target name is free. A declaration that survives this
 /// is one a refresh can always act on.
+///
+/// Each accepted column joins the schema the next one resolves against, so a
+/// batch may declare `a` and then `b = a + 1` in one commit. Refresh fills a
+/// column's computed inputs before the column, so the order of refresh calls
+/// does not matter.
 pub(crate) fn plan(schema: SchemaRef, columns: &[(String, String)]) -> Result<Vec<ArrowField>> {
     if columns.is_empty() {
         return Err(Error::InvalidInput {
@@ -1280,11 +1285,11 @@ pub(crate) fn plan(schema: SchemaRef, columns: &[(String, String)]) -> Result<Ve
         });
     }
 
+    let mut schema = schema;
     let mut fields = Vec::with_capacity(columns.len());
-    let mut declared: Vec<&str> = Vec::with_capacity(columns.len());
 
     for (name, expression) in columns {
-        if schema.field_with_name(name).is_ok() || declared.contains(&name.as_str()) {
+        if schema.field_with_name(name).is_ok() {
             return Err(Error::ColumnAlreadyExists { name: name.clone() });
         }
 
@@ -1292,14 +1297,29 @@ pub(crate) fn plan(schema: SchemaRef, columns: &[(String, String)]) -> Result<Ve
 
         // Declared columns start entirely null, so nullability is a property
         // of the declaration rather than of what the expression yields.
-        fields.push(
-            ArrowField::new(name, bound.data_type, true)
-                .with_metadata(computed_column_metadata(expression, &bound.inputs)),
-        );
-        declared.push(name);
+        let field = ArrowField::new(name, bound.data_type, true)
+            .with_metadata(computed_column_metadata(expression, &bound.inputs));
+        schema = Arc::new(ArrowSchema::new_with_metadata(
+            schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(Arc::new(field.clone())))
+                .collect::<Fields>(),
+            schema.metadata().clone(),
+        ));
+        fields.push(field);
     }
 
     Ok(fields)
+}
+
+/// Check `(name, expression)` pairs against `schema` exactly as
+/// [`AddColumnsBuilder::computed`](super::AddColumnsBuilder::computed) will
+/// admit them, without committing. For callers that stage declarations
+/// behind other work and need the rejection before any of it lands.
+pub fn validate_declarations(schema: SchemaRef, columns: &[(String, String)]) -> Result<()> {
+    plan(schema, columns).map(drop)
 }
 
 /// Build the transform that declares `columns` against `schema`.
@@ -1580,6 +1600,40 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::ColumnAlreadyExists { name } if name == "dup"));
         assert!(declared(&table).await.is_empty());
+    }
+
+    /// A batch may build on itself: one commit, and the later entry's inputs
+    /// name the earlier one.
+    #[tokio::test]
+    async fn test_a_declaration_may_read_one_declared_before_it() {
+        let table = table_with_ints("chain").await;
+        let before = table.version().await.unwrap();
+        add_computed(
+            &table,
+            &[("a".into(), "x + 1".into()), ("b".into(), "a * 2".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(table.version().await.unwrap(), before + 1);
+        let declared = declared(&table).await;
+        assert_eq!(declared[1].name, "b");
+        assert_eq!(declared[1].inputs, vec!["a".to_string()]);
+
+        // Order is the dependency order; reading ahead is still unknown.
+        let err = add_computed(
+            &table,
+            &[("c".into(), "d + 1".into()), ("d".into(), "x + 1".into())],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidExpression { column, .. } if column == "c"));
+        assert!(
+            validate_declarations(
+                table.schema().await.unwrap(),
+                &[("e".into(), "random()".into())]
+            )
+            .is_err()
+        );
     }
 
     /// A column added by an ordinary transform is materialized, not bound, so
